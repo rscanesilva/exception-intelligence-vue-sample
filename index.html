@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Vue SDK Test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+    button { margin: 6px; padding: 8px 16px; cursor: pointer; }
+    .log  { margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 4px; min-height: 60px; white-space: pre-wrap; }
+    .err  { color: red; }
+    .ok   { color: green; }
+  </style>
+</head>
+<body>
+  <h2>Exception Intelligence — Vue SDK Test</h2>
+  <p>Servidor: <code>http://localhost:8090</code></p>
+
+  <div id="app"></div>
+
+  <!-- Vue 3 CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+
+  <script type="module">
+    // ── Inline minimal SDK (same logic as sdks/vue/src) ──────────────────
+    const SDK_CONFIG = {
+      serverUrl: 'http://localhost:8090',
+      serviceName: 'vue-sample',
+      environment: 'local',
+      projectUrls: ['localhost'],
+    };
+
+    function parseStack(stack = '', projectUrls = []) {
+      const CHROME = /^\s*at (?:async )?(.+?) \((.+):(\d+):(\d+)\)$/;
+      const ANON   = /^\s*at (?:async )?(.+):(\d+):(\d+)$/;
+      const FF     = /^(.+?)@(.+):(\d+):(\d+)$/;
+      const VENDOR = ['unpkg.com', 'cdn.jsdelivr', 'vue.global'];
+
+      return stack.split('\n').flatMap(line => {
+        let m = CHROME.exec(line) || ANON.exec(line) || FF.exec(line);
+        if (!m) return [];
+        const [, fn, file, ln, col] = m.length === 5 ? m : [null, undefined, m[1], m[2], m[3]];
+        const isProject = !VENDOR.some(v => file.includes(v))
+          && file !== '<anonymous>'
+          && (projectUrls.length === 0 || projectUrls.some(u => file.includes(u)));
+        return [{ file, function: fn, line: parseInt(ln), column: parseInt(col), isProjectCode: isProject }];
+      });
+    }
+
+    function fingerprint(type, frames) {
+      const top = frames.find(f => f.isProjectCode) ?? frames[0];
+      const key = top ? `${type}:${top.function ?? top.file}:${top.line}` : type;
+      let h = 5381;
+      for (let i = 0; i < key.length; i++) h = ((h << 5) + h) ^ key.charCodeAt(i);
+      return (h >>> 0).toString(16).substring(0, 8);
+    }
+
+    async function sendToServer(err, origin = 'manual') {
+      const frames = parseStack(err.stack, SDK_CONFIG.projectUrls);
+      const fp = fingerprint(err.constructor.name, frames);
+      const report = {
+        language: 'javascript', framework: 'vue',
+        serviceName: SDK_CONFIG.serviceName, environment: SDK_CONFIG.environment,
+        timestamp: new Date().toISOString(), threadName: origin,
+        exception: { type: err.constructor.name, message: err.message, rawStackTrace: err.stack, frames },
+        request: { uri: location.href, headers: { 'User-Agent': navigator.userAgent } },
+        fingerprint: fp,
+      };
+      try {
+        const res = await fetch(`${SDK_CONFIG.serverUrl}/v1/exceptions`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report),
+        });
+        return res.status;
+      } catch (e) { return `network error: ${e.message}`; }
+    }
+
+    // ── Vue app ───────────────────────────────────────────────────────────
+    const { createApp, ref } = Vue;
+
+    createApp({
+      setup() {
+        const log = ref('Pronto. Clique em um botão para disparar um erro.');
+
+        function addLog(msg, isError = false) {
+          log.value = `[${new Date().toLocaleTimeString()}] ${msg}`;
+          console[isError ? 'error' : 'log'](msg);
+        }
+
+        // Instala o error handler do Vue
+        return { log };
+      },
+
+      template: `
+        <div>
+          <button @click="triggerTypeError">TypeError (Vue handler)</button>
+          <button @click="triggerUnhandledRejection">Unhandled Promise Rejection</button>
+          <button @click="triggerManual">Erro manual → servidor</button>
+          <button @click="callOk">✓ Checar servidor /health</button>
+          <div class="log">{{ log }}</div>
+        </div>
+      `,
+
+      methods: {
+        triggerTypeError() {
+          // Vai capturado pelo Vue errorHandler
+          const obj = null;
+          obj.name; // TypeError
+        },
+
+        triggerUnhandledRejection() {
+          // Vai para window.onunhandledrejection
+          Promise.reject(new RangeError('simulated unhandled rejection from Vue app'));
+          this.log = '[' + new Date().toLocaleTimeString() + '] Unhandled rejection disparado — verifique o servidor.';
+        },
+
+        async triggerManual() {
+          const err = new Error('Manual error triggered from Vue test button');
+          const status = await sendToServer(err, 'manual-button');
+          this.log = `[${new Date().toLocaleTimeString()}] Enviado → servidor respondeu HTTP ${status}`;
+        },
+
+        async callOk() {
+          try {
+            const res = await fetch('http://localhost:8090/v1/exceptions/health');
+            this.log = `[${new Date().toLocaleTimeString()}] Servidor OK → ${await res.text()}`;
+          } catch (e) {
+            this.log = `[${new Date().toLocaleTimeString()}] Servidor indisponível: ${e.message}`;
+          }
+        },
+      },
+    }).config.errorHandler = async (err, _instance, info) => {
+      const status = await sendToServer(err, `vue:${info}`);
+      document.querySelector('.log').textContent =
+        `[${new Date().toLocaleTimeString()}] Vue errorHandler capturou ${err.constructor.name} — enviado, servidor: HTTP ${status}`;
+    };
+
+    // window unhandledrejection
+    window.addEventListener('unhandledrejection', async e => {
+      const err = e.reason instanceof Error ? e.reason : new Error(String(e.reason));
+      const status = await sendToServer(err, 'unhandledrejection');
+      document.querySelector('.log').textContent =
+        `[${new Date().toLocaleTimeString()}] window unhandledrejection: ${err.message} — HTTP ${status}`;
+    });
+
+    const vm = createApp({
+      setup() { return { log: Vue.ref('Pronto.') }; },
+      template: `
+        <div>
+          <button onclick="window.__triggerTypeError()">TypeError (Vue handler)</button>
+          <button onclick="window.__triggerRejection()">Unhandled Rejection</button>
+          <button onclick="window.__triggerManual()">Erro manual</button>
+          <button onclick="window.__checkHealth()">✓ Health check</button>
+          <div class="log" id="log">Pronto. Clique para disparar um erro.</div>
+        </div>
+      `,
+    });
+
+    function setLog(msg) {
+      document.getElementById('log').textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    }
+
+    window.__triggerTypeError = () => {
+      try { null.name; } catch(e) {
+        sendToServer(e, 'vue:manual').then(s => setLog(`TypeError enviado → HTTP ${s}`));
+      }
+    };
+    window.__triggerRejection = () => {
+      Promise.reject(new RangeError('simulated rejection'));
+    };
+    window.__triggerManual = async () => {
+      const s = await sendToServer(new Error('Manual test error — botão clicado'), 'manual');
+      setLog(`Manual error enviado → HTTP ${s}`);
+    };
+    window.__checkHealth = async () => {
+      try {
+        const r = await fetch('http://localhost:8090/v1/exceptions/health');
+        setLog(`Servidor respondeu: ${await r.text()}`);
+      } catch(e) { setLog(`Servidor fora do ar: ${e.message}`); }
+    };
+
+    vm.mount('#app');
+  </script>
+</body>
+</html>
