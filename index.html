@@ -27,6 +27,11 @@
       serviceName: 'vue-sample',
       environment: 'local',
       projectUrls: ['localhost'],
+      repository: {
+        owner: 'rscanesilva',
+        name: 'exception-intelligence-vue-sample',
+        branch: 'main',
+      },
     };
 
     function parseStack(stack = '', projectUrls = []) {
@@ -64,6 +69,7 @@
         exception: { type: err.constructor.name, message: err.message, rawStackTrace: err.stack, frames },
         request: { uri: location.href, headers: { 'User-Agent': navigator.userAgent } },
         fingerprint: fp,
+        repository: SDK_CONFIG.repository,
       };
       try {
         const res = await fetch(`${SDK_CONFIG.serverUrl}/v1/exceptions`, {
